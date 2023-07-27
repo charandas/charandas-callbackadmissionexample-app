@@ -3,7 +3,11 @@ package plugin
 import (
 	"encoding/json"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
-	admissionsV1 "k8s.io/api/admission/v1"
+	admissionV1 "k8s.io/api/admission/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/conversion"
+	"k8s.io/apimachinery/pkg/runtime"
 	"net/http"
 )
 
@@ -41,36 +45,47 @@ func (a *App) handleEcho(w http.ResponseWriter, req *http.Request) {
 
 // registerRoutes takes a *http.ServeMux and registers some HTTP handlers.
 func (a *App) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/k8s/admission/mutation", a.CallAdmission)
-	mux.HandleFunc("/k8s/admission/validation", a.CallAdmission)
+	mux.HandleFunc("/k8s/admission/mutation", a.CallMutation)
+	mux.HandleFunc("/k8s/admission/validation", a.CallValidation)
 }
 
 // If we can implement a function, we can perhaps pass the HTTP router to it
-func (a *App) CallAdmission(w http.ResponseWriter, req *http.Request) {
-	review := &admissionsV1.AdmissionReview{}
+func (a *App) CallValidation(w http.ResponseWriter, req *http.Request) {
+	a.performValidationOrMutation(w, req, false)
+}
+
+func (a *App) CallMutation(w http.ResponseWriter, req *http.Request) {
+	a.performValidationOrMutation(w, req, true)
+}
+
+// If we can implement a function, we can perhaps pass the HTTP router to it
+func (a *App) performValidationOrMutation(w http.ResponseWriter, req *http.Request, isMutating bool) {
+	request := &admissionV1.AdmissionRequest{}
 
 	log.DefaultLogger.Info("Before decode")
 
-	if err := json.NewDecoder(req.Body).Decode(&review); err != nil {
+	if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// failedResultStatus
-	/* _ := &metav1.Status{
-		TypeMeta: metav1.TypeMeta{},
-		ListMeta: metav1.ListMeta{},
-		Status:   "",
-		Message:  "",
-		Reason:   "",
-		Details:  nil,
-		Code:     0,
-	} */
+	var obj runtime.Object
+	var scope conversion.Scope
+	if err := runtime.Convert_runtime_RawExtension_To_runtime_Object(&request.Object, &obj, scope); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	log.DefaultLogger.Info("In plugin", "Req:", review)
+	innerObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	response := &admissionsV1.AdmissionResponse{
-		UID:              review.Request.UID,
+	u := unstructured.Unstructured{Object: innerObj}
+
+	response := &admissionV1.AdmissionResponse{
+		UID:              request.UID,
 		Allowed:          true,
 		Result:           nil,
 		Patch:            nil,
@@ -79,14 +94,54 @@ func (a *App) CallAdmission(w http.ResponseWriter, req *http.Request) {
 		Warnings:         nil,
 	}
 
-	responseBytes, err := response.Marshal()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if spec := u.Object["spec"]; spec != nil {
+		specAsserted, _ := spec.(map[string]interface{})
+
+		if !isMutating {
+			if specAsserted["fail_validation"].(bool) {
+				response.Allowed = false
+				response.Result = &metav1.Status{
+					TypeMeta: metav1.TypeMeta{},
+					ListMeta: metav1.ListMeta{},
+					Status:   "",
+					Message:  "",
+					Reason:   "",
+					Details:  nil,
+					Code:     0,
+				}
+			}
+		} else {
+			jsonPatch := map[string]string{
+				"op":    "add",
+				"path":  "/spec/mutated_default",
+				"value": "default_value",
+			}
+			response.Patch, err = json.Marshal([]map[string]string{jsonPatch})
+			if err != nil {
+				response.Result = &metav1.Status{
+					TypeMeta: metav1.TypeMeta{},
+					ListMeta: metav1.ListMeta{},
+					Status:   "",
+					Message:  "Could not translate the patch",
+					Reason:   "",
+					Details:  nil,
+					Code:     0,
+				}
+			} else {
+				response.Result = &metav1.Status{
+					Status: "Success",
+				}
+			}
+			pT := admissionV1.PatchTypeJSONPatch
+			response.PatchType = &pT
+		}
+
 	}
 
+	log.DefaultLogger.Info("In plugin", "isMutating", isMutating)
+
 	w.Header().Add("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(responseBytes); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
